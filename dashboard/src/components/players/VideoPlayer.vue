@@ -183,13 +183,20 @@ const emit = defineEmits(['close', 'error', 'player-change', 'next-episode', 'ep
 // 响应式数据
 const videoPlayer = ref(null)
 const mediaPlayerManager = ref(null)
-const autoNext = ref(true) // 默认开启自动连播
-const loopEnabled = ref(JSON.parse(localStorage.getItem('loopEnabled') || 'false')) // 循环播放开关，从本地存储读取
+
+// 初始化互斥逻辑：自动连播和循环播放不能同时开启
+const savedLoopEnabled = JSON.parse(localStorage.getItem('loopEnabled') || 'false')
+const savedAutoNextEnabled = JSON.parse(localStorage.getItem('autoNextEnabled') || 'true')
+
+// 确保互斥：如果循环播放开启，则关闭自动连播
+const autoNext = ref(savedLoopEnabled ? false : savedAutoNextEnabled)
+const loopEnabled = ref(savedLoopEnabled)
 const showCountdown = ref(false)
 const showAutoNextDialog = ref(false)
 const autoNextCountdown = ref(10)
 const countdownTimer = ref(null)
 const isProcessingAutoNext = ref(false) // 防止重复触发自动连播
+const isProcessingLoop = ref(false) // 防止重复触发循环播放
 const currentSpeed = ref(1) // 当前播放倍速
 
 // 调试相关
@@ -200,6 +207,9 @@ const detectedFormat = ref('')
 const currentQuality = ref('默认')
 const availableQualities = ref([])
 const currentPlayingUrl = ref('')
+
+// 代理设置变化追踪器 - 用于强制 proxyVideoUrl 计算属性重新计算
+const proxySettingsVersion = ref(0)
 
 // 初始化画质数据
 const initQualityData = () => {
@@ -273,12 +283,19 @@ const switchVideoSource = (newUrl, seekTime = 0, autoPlay = false) => {
   })
   
   try {
+    // 处理代理播放地址
+    const headers = props.headers || {}
+    const finalUrl = processVideoUrl(newUrl, headers)
+    if (finalUrl !== newUrl) {
+      console.log('🔄 [代理播放] 切换视频源使用代理地址')
+    }
+    
     // 使用MediaPlayerManager切换视频
     if (mediaPlayerManager.value) {
-      mediaPlayerManager.value.switchVideo(newUrl)
+      mediaPlayerManager.value.switchVideo(finalUrl)
     } else {
-      // 原生播放器直接切换
-      videoPlayer.value.src = newUrl
+      // 原生播放器使用代理处理后的地址
+      videoPlayer.value.src = finalUrl
     }
     
     // 等待视频加载后跳转到指定时间
@@ -312,6 +329,9 @@ const showDebugButton = computed(() => {
 
 // 计算属性：代理后的视频链接
 const proxyVideoUrl = computed(() => {
+  // 依赖 proxySettingsVersion 来响应代理设置变化
+  proxySettingsVersion.value
+  
   // 使用当前实际播放的URL，如果没有则使用props.videoUrl
   const actualUrl = currentPlayingUrl.value || props.videoUrl
   if (!actualUrl) return ''
@@ -343,6 +363,13 @@ const hideAutoNextDialog = () => {
   }
 }
 
+// 重置所有防抖标志
+const resetDebounceFlags = () => {
+  isProcessingAutoNext.value = false
+  isProcessingLoop.value = false
+  console.log('所有防抖标志已重置')
+}
+
 // 播放下一集
 const playNextEpisode = () => {
   if (hasNextEpisode()) {
@@ -351,7 +378,7 @@ const playNextEpisode = () => {
     hideAutoNextDialog()
     // 重置防抖标志
     setTimeout(() => {
-      isProcessingAutoNext.value = false
+      resetDebounceFlags()
     }, 2000) // 2秒后重置，给视频切换足够的时间
   }
 }
@@ -389,6 +416,9 @@ const {
 // 切换自动连播
 const toggleAutoNext = () => {
   autoNext.value = !autoNext.value
+  // 保存自动连播状态到本地存储
+  localStorage.setItem('autoNextEnabled', JSON.stringify(autoNext.value))
+  
   // 如果开启自动连播，则关闭循环播放
   if (autoNext.value) {
     loopEnabled.value = false
@@ -406,6 +436,7 @@ const toggleLoop = () => {
   // 如果开启循环播放，则关闭自动连播
   if (loopEnabled.value) {
     autoNext.value = false
+    localStorage.setItem('autoNextEnabled', 'false')
   }
   
   console.log('循环播放开关:', loopEnabled.value ? '开启' : '关闭')
@@ -508,6 +539,9 @@ const initVideoPlayer = (url) => {
   // 重置片头片尾跳过状态
   resetSkipState()
   
+  // 重置所有防抖标志
+  resetDebounceFlags()
+  
   // 首先判断链接类型
   if (!isDirectVideoLink(url)) {
     Message.info('检测到网页链接，正在新窗口打开...')
@@ -539,22 +573,33 @@ const initVideoPlayer = (url) => {
   // 视频结束事件处理函数
   const handleVideoEnded = () => {
     try {
-      // 防抖：如果正在处理自动连播，则忽略
-      if (isProcessingAutoNext.value) {
+      // 防抖：如果正在处理自动连播或循环播放，则忽略
+      if (isProcessingAutoNext.value || isProcessingLoop.value) {
+        console.log('防抖：忽略重复的视频结束事件')
         return
       }
       
       // 优先处理循环播放
       if (loopEnabled.value) {
         console.log('循环播放：重新播放当前选集')
+        isProcessingLoop.value = true // 设置循环播放防抖标志
+        
         // 重新执行当前选集的播放逻辑
         setTimeout(() => {
           try {
             // 触发重新选择当前选集，这会重新获取播放链接
             emit('episode-selected', props.currentEpisodeIndex)
+            
+            // 延迟重置防抖标志，给视频切换足够的时间
+            setTimeout(() => {
+              isProcessingLoop.value = false
+              console.log('循环播放防抖标志已重置')
+            }, 3000) // 3秒后重置，确保视频加载完成
+            
           } catch (error) {
             console.error('循环播放触发选集事件失败:', error)
             Message.error('循环播放失败，请重试')
+            isProcessingLoop.value = false // 出错时立即重置
           }
         }, 1000)
         return
@@ -575,6 +620,8 @@ const initVideoPlayer = (url) => {
     } catch (error) {
       console.error('视频结束事件处理失败:', error)
       Message.error('视频结束处理失败')
+      // 出错时重置所有防抖标志
+      resetDebounceFlags()
     }
   }
 
@@ -688,8 +735,8 @@ const initVideoPlayer = (url) => {
       video.addEventListener('seeking', handleSeeking)
       video.addEventListener('seeked', handleSeeked)
     } else {
-        // 原生视频播放 - 直接设置src
-        video.src = url
+        // 原生视频播放 - 使用代理处理后的地址
+        video.src = finalUrl
       }
     
   } catch (error) {
@@ -822,15 +869,34 @@ watch(() => props.initialQuality, (newQuality) => {
   }
 }, { immediate: true })
 
+// 处理代理设置变化
+const handleAddressSettingsChange = () => {
+  console.log('检测到代理设置变化，重新初始化播放器')
+  
+  // 更新代理设置版本号，强制 proxyVideoUrl 计算属性重新计算
+  proxySettingsVersion.value++
+  
+  if (props.videoUrl && props.visible) {
+    nextTick(() => {
+      initVideoPlayer(props.videoUrl)
+    })
+  }
+}
+
 // 组件挂载时初始化
 onMounted(() => {
   initSkipSettings()
   initQualityData()
+  // 添加代理设置变化监听
+  window.addEventListener('addressSettingsChanged', handleAddressSettingsChange)
 })
 
 // 组件卸载时清理资源
 onUnmounted(() => {
   console.log('VideoPlayer组件卸载，清理播放器资源')
+  
+  // 移除代理设置变化监听器
+  window.removeEventListener('addressSettingsChanged', handleAddressSettingsChange)
   
   // 清理视频播放器
   if (videoPlayer.value) {
